@@ -1,25 +1,18 @@
 from dotenv import load_dotenv
 import os
 import traceback
+import torch
 
-from configs.infini_attention_config import InfiniAttentionConfig
-from configs.infini_armt_config import InfiniARMTConfig
+from configs.base_memory_config import BaseMemoryConfig
 from experiment import Experiment
 
 
 def main():
     try:
+        torch.autograd.set_detect_anomaly(True)
         load_dotenv()
-
-        experiment_name = os.getenv("EXPERIMENT", "ExpA")
-        experiment_map = {
-            "InfiniAttentionConfig": InfiniAttentionConfig,
-            "InfiniARMTConfig": InfiniARMTConfig
-        }
-
-        config = experiment_map[experiment_name]()
         
-        experiment = Experiment(config=config)
+        experiment = Experiment(config=BaseMemoryConfig)
         experiment.run()
 
     except Exception as e:
