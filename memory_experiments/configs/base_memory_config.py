@@ -26,3 +26,7 @@ class BaseMemoryConfig:
     max_valid_steps : int = 5000
     max_test_steps : int = 800
     checkpointing_steps : int = 2000
+    segment_length : int = 512  # based on ARMT
+
+
+    memory_approach : str = "armt_method"  # "infini_attention"
