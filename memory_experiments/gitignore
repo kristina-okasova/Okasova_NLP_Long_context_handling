@@ -1,0 +1,9 @@
+.env
+.vscode/
+__pycache__/
+.venv/
+configs/__pycache__/
+memory_approaches/__pycache__/
+wandb/*
+flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+**/.ipynb_checkpoints
