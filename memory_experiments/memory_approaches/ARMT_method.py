@@ -18,8 +18,10 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from typing import Optional, Any, cast, Union
 
 
-class InfiniARMTApproach():
-    def __init__(self, num_attention_heads, num_key_value_heads, head_dim, hidden_size, W_mb):
+class ARMTApproach(nn.Module):
+    def __init__(self, num_attention_heads, num_key_value_heads, head_dim, hidden_size, number_of_layers):
+        super().__init__()
+
         self.nu = 3
         self.eps = 1e-8
         self.correction = True
@@ -28,43 +30,56 @@ class InfiniARMTApproach():
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.hidden_size = hidden_size
+        self.dpfp_dim = self.head_dim * 2 * self.nu
 
-        self.W_mb = W_mb
-        self.memory, self.norm = None, None
+        self.W_mb = nn.Linear(self.hidden_size, self.hidden_size)
+        self.memory = nn.Parameter(
+            torch.zeros(
+                number_of_layers,
+                self.num_attention_heads,
+                self.dpfp_dim,
+                self.head_dim
+            )
+        )
+
+        self.norm = nn.Parameter(
+            torch.zeros(
+                number_of_layers,
+                self.num_attention_heads,
+                self.dpfp_dim
+            )
+        )
         
 
     def associate(self, hidden_states: torch.Tensor, layer_idx: int, q_proj, memory_gate) -> torch.Tensor:
-        memory_layer = self.memory[layer_idx].detach() if self.memory is not None and layer_idx < self.memory.size(0) else None
-        norm_layer = self.norm[layer_idx].detach() if self.norm is not None and layer_idx < self.norm.size(0) else None
-        if memory_layer is not None and norm_layer is not None:
-            batch_size, seq_len, _ = hidden_states.size()
+        memory_layer = self.memory[layer_idx].detach().clone()
+        norm_layer = self.norm[layer_idx].detach().clone()
+        
+        batch_size, seq_len, _ = hidden_states.size()
 
-            query_states = q_proj(hidden_states)
-            query_states = query_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        query_states = q_proj(hidden_states)
+        query_states = query_states.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
 
-            memory_hidden_states = self._retrieve_from_memory(
-                query_states, 
-                memory_layer,
-                norm_layer
-            )
+        memory_hidden_states = self._retrieve_from_memory(
+            query_states, 
+            memory_layer,
+            norm_layer
+        )
 
-            memory_hidden_states = memory_hidden_states.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-            memory_gate.to(hidden_states.device)
-            gate = torch.sigmoid(memory_gate(hidden_states))
-            hidden_states = hidden_states + gate * memory_hidden_states
+        memory_hidden_states = memory_hidden_states.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        memory_gate.to(hidden_states.device)
+        gate = torch.sigmoid(memory_gate(hidden_states))
+        hidden_states = hidden_states + gate * memory_hidden_states
 
         return hidden_states
 
 
     def _retrieve_from_memory(self, Q, memory, norm):
-        if memory is None or norm is None:
-            return torch.zeros_like(Q)
-        
         mq = self.dpfp(Q)
         mq = F.normalize(mq, dim=-1, p=2.0)
         
-        num = torch.matmul(mq, memory)   # (B, H, S, D)
-        denom = (mq * norm.detach().unsqueeze(2)).sum(dim=-1, keepdim=True) + self.eps
+        num = torch.matmul(mq, memory)
+        denom = (mq * norm.unsqueeze(0).unsqueeze(2)).sum(dim=-1, keepdim=True) + self.eps
 
         return num / denom
 
@@ -82,21 +97,19 @@ class InfiniARMTApproach():
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.repeat_interleave(self.num_attention_heads // self.num_key_value_heads, dim=1)
 
-        memory_layer = self.memory[layer_idx].detach() if self.memory is not None and layer_idx < self.memory.size(0) else None
-        norm_layer = self.norm[layer_idx].detach() if self.norm is not None and layer_idx < self.norm.size(0) else None
-        if not memory_layer is None and not norm_layer is None:
-            extended_mk = mk.repeat_interleave(self.num_attention_heads // self.num_key_value_heads, dim=1)
-            num = torch.matmul(extended_mk, memory_layer)
-            denom = (extended_mk * norm_layer.unsqueeze(2)).sum(dim=-1, keepdim=True) + self.eps
-            previous_value_states = num / denom
+        memory_layer = self.memory[layer_idx].detach().clone()
+        norm_layer = self.norm[layer_idx].detach().clone()
 
-            if self.correction:
-                new_info_coef = (1 - denom / (torch.linalg.norm(extended_mk, dim=-1) ** 2)[..., None])
-                new_info_coef = torch.clip(new_info_coef, 0, 1)
-            else:
-                new_info_coef = 1
-        else: 
-            previous_value_states = torch.zeros_like(value_states)
+        extended_mk = mk.repeat_interleave(self.num_attention_heads // self.num_key_value_heads, dim=1)
+        num = torch.matmul(extended_mk, memory_layer)
+
+        denom = (extended_mk * norm_layer.unsqueeze(0).unsqueeze(2)).sum(dim=-1, keepdim=True) + self.eps
+        previous_value_states = num / denom
+
+        if self.correction:
+            new_info_coef = (1 - denom / (torch.linalg.norm(extended_mk, dim=-1) ** 2)[..., None])
+            new_info_coef = torch.clip(new_info_coef, 0, 1)
+        else:
             new_info_coef = 1
     
         mv = value_states - previous_value_states
@@ -108,32 +121,12 @@ class InfiniARMTApproach():
         mk_T = extended_mk.transpose(-1, -2)
         associations = torch.matmul(mk_T, weighted_mv)
 
-        if memory_layer is not None and norm_layer is not None:
-            new_memory = memory_layer + associations
-            new_norm = norm_layer + (new_info_coef * extended_mk).sum(dim=-2)
-        else:
-            new_memory = associations
-            new_norm = (new_info_coef * extended_mk).sum(dim=-2)
+        delta_memory = associations.squeeze(0)
+        delta_norm = (new_info_coef * extended_mk).sum(dim=-2).squeeze(0)
 
-        new_memory = new_memory.detach().unsqueeze(0)
-        new_norm = new_norm.detach().unsqueeze(0)
-
-        if self.memory is None or self.norm is None:
-            self.memory = new_memory.to(hidden_states.device)
-            self.norm = new_norm.to(hidden_states.device)
-        else:
-            previous_memory = self.memory.detach().clone()
-            previous_norm = self.norm.detach().clone()
-
-            if self.memory.size(0) <= layer_idx:
-                previous_memory = torch.cat([previous_memory, new_memory], dim=0)
-                previous_norm = torch.cat([previous_norm, new_norm], dim=0)
-            else:
-                previous_memory[layer_idx] = new_memory
-                previous_norm[layer_idx] = new_norm
-
-            self.memory = previous_memory
-            self.norm = previous_norm
+        with torch.no_grad():
+            self.memory[layer_idx] = self.memory[layer_idx] + delta_memory
+            self.norm[layer_idx] = self.norm[layer_idx] + delta_norm
 
     def dpfp(self, x):
         x = torch.cat([F.relu(x), F.relu(-x)], dim=-1)
@@ -142,7 +135,7 @@ class InfiniARMTApproach():
         return x_repeat * x_rolled
 
 
-class InfiniARMTLlamaModel(LlamaPreTrainedModel):
+class ARMTLlamaModel(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -155,14 +148,13 @@ class InfiniARMTLlamaModel(LlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.W_mb = nn.Linear(config.hidden_size, config.hidden_size)
 
-        self.infini_armt_approach = InfiniARMTApproach(
+        self.armt_approach = ARMTApproach(
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             head_dim=config.hidden_size // config.num_attention_heads,
             hidden_size=config.hidden_size,
-            W_mb=self.W_mb
+            number_of_layers=config.num_hidden_layers
         )
 
 
@@ -217,7 +209,7 @@ class InfiniARMTLlamaModel(LlamaPreTrainedModel):
             if hidden_states is None:
                 raise ValueError("hidden_states must not be None")
             
-            hidden_states = self.infini_armt_approach.associate(
+            hidden_states = self.armt_approach.associate(
                 hidden_states, 
                 cast(int, decoder_layer.self_attn.layer_idx),  # type: ignore
                 decoder_layer.self_attn.q_proj,  # type: ignore
@@ -235,7 +227,7 @@ class InfiniARMTLlamaModel(LlamaPreTrainedModel):
             )
 
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
-            self.infini_armt_approach._update_memory(
+            self.armt_approach._update_memory(
                 hidden_states, 
                 decoder_layer.self_attn.layer_idx,  # type: ignore
                 decoder_layer.self_attn.k_proj,  # type: ignore
@@ -249,10 +241,10 @@ class InfiniARMTLlamaModel(LlamaPreTrainedModel):
         ) 
     
 
-class InfiniARMTLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+class ARMTLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
-        self.model = InfiniARMTLlamaModel(config)
+        self.model = ARMTLlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.vocab_size = config.vocab_size
 
@@ -291,6 +283,9 @@ class InfiniARMTLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         if labels is not None and (labels != -100).sum() != 0:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
+        if loss is not None and (torch.isnan(loss) or torch.isinf(loss)):
+            print("Loss contains NaN or Inf")
+
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -299,5 +294,11 @@ class InfiniARMTLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
     
+    def reset_memory(self):
+        with torch.no_grad():
+            self.model.armt_approach.memory.zero_()  # type: ignore
+            self.model.armt_approach.norm.zero_()  # type: ignore
+
+    
     def get_memory(self):
-        return self.model.infini_armt_approach.memory
+        return self.model.armt_approach.memory
