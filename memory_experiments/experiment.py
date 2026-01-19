@@ -30,7 +30,7 @@ from datasets import load_dataset, DatasetDict, Dataset, concatenate_datasets
 from torch.utils.data import DataLoader
 
 from memory_approaches.infini_attention import InfiniAttentionLlamaForCausalLM
-from memory_approaches.infini_armt_attention import InfiniARMTLlamaForCausalLM
+from memory_approaches.ARMT_method import ARMTLlamaForCausalLM
 from generate_dataset import DatasetGenerator
 from throughput_meter import ThroughputMeter
 
@@ -108,8 +108,8 @@ class Experiment:
                 device_map="auto",
                 dtype="auto"
             )
-        elif self.config.memory_approach == "infini_armt_attention":
-            self.model = InfiniARMTLlamaForCausalLM.from_pretrained(
+        elif self.config.memory_approach == "armt_method":
+            self.model = ARMTLlamaForCausalLM.from_pretrained(
                 self.config.model_name,
                 config=self.model_config,
                 quantization_config=self.bnb_config,
@@ -130,7 +130,7 @@ class Experiment:
             )
 
         self.model.to(self.device)  # type: ignore
-        if self.config.memory_approach == "infini_armt_attention":
+        if self.config.memory_approach == "armt_method":
             self.model.model.armt_memory_gate = nn.Linear(
                 self.model_config.hidden_size, 
                 self.model_config.hidden_size, 
@@ -318,6 +318,11 @@ class Experiment:
                     load_from_cache_file=True,
                     desc=f"Grouping texts in chunks of {self.config.block_size}",
                 )
+        print("Number of segments")
+        if lm_datasets is not None:
+            print(len(lm_datasets["train"]))
+            print(len(lm_datasets["validation"]))
+            print(len(lm_datasets["test"]))
 
         with self.accelerator.main_process_first():
             chat_lm_datasets = None
@@ -330,6 +335,11 @@ class Experiment:
                     load_from_cache_file=True,
                     desc="Turning data into chat template",
                 )
+        print("Number of segments")
+        if chat_lm_datasets is not None:
+            print(len(chat_lm_datasets["train"]))
+            print(len(chat_lm_datasets["validation"]))
+            print(len(chat_lm_datasets["test"]))
 
         """anchor_dataset = self.dataset_generator.generate_anchor_dataset(int(len(chat_lm_datasets["train"]) * 0.05) if chat_lm_datasets is not None else 1000)
         if chat_lm_datasets is not None and anchor_dataset is not None:
@@ -481,7 +491,7 @@ class Experiment:
             self.model.train()
             
             total_train_loss, loss = 0, torch.empty(0)
-            for _, batch in enumerate(self.train_dataloader):
+            for step, batch in enumerate(self.train_dataloader):
                 input_ids = batch["input_ids"]
                 labels = batch["labels"]
                 total_block_loss = 0
@@ -582,13 +592,16 @@ class Experiment:
 
                 if self.completed_steps >= (epoch + 1) * self.config.max_train_steps / self.config.number_of_epochs:
                     break
+                if step == 5:
+                    break
                 
             self.model.eval()
             torch.cuda.reset_peak_memory_stats()
             total_val_loss, total_tokens, self.valid_completed_steps = 0, 0, 0
-            for _, batch in enumerate(self.eval_dataloader):
+            for step, batch in enumerate(self.eval_dataloader):
                 input_ids = batch["input_ids"]
                 labels = batch["labels"]
+                self.model.reset_memory()  # type: ignore
                 
                 for i in range(input_ids.shape[0]):
                     with torch.no_grad():
@@ -619,6 +632,8 @@ class Experiment:
                     self.throughput.update(num_tokens)
                     self.valid_completed_steps += 1
                     if self.valid_completed_steps >= self.config.max_valid_steps / self.config.number_of_epochs:
+                        break
+                    if step == 5:
                         break
                 
             val_loss = total_val_loss / total_tokens
@@ -671,9 +686,10 @@ class Experiment:
         progress_bar = tqdm(range(self.config.max_test_steps), disable=not self.accelerator.is_local_main_process)
         progress_bar.update(self.test_completed_steps)
         
-        for _, batch in enumerate(self.test_dataloader):
+        for step, batch in enumerate(self.test_dataloader):
             input_ids = batch["input_ids"]
             labels = batch["labels"]
+            self.model.reset_memory()  # type: ignore
             
             for i in range(input_ids.shape[0]):
                 with torch.no_grad():
@@ -705,6 +721,8 @@ class Experiment:
                 self.test_completed_steps += 1
                 if self.test_completed_steps >= self.config.max_test_steps:
                     break
+                if step == 5:
+                    break
             
         test_loss = total_test_loss / total_tokens
         try:
@@ -716,9 +734,9 @@ class Experiment:
         if memory is not None:  # type: ignore
             detached_memory = memory.detach()  # type: ignore
             memory_stats = {
-                "test_memory_norm_mean": detached_memory.norm(dim=-1).mean().item(),
-                "test_memory_norm_max": detached_memory.norm(dim=-1).max().item(),
-                "test_memory_sparsity": (detached_memory.abs() < 1e-4).float().mean().item(),
+                "memory_norm_mean": detached_memory.norm(dim=-1).mean().item(),
+                "memory_norm_max": detached_memory.norm(dim=-1).max().item(),
+                "memory_sparsity": (detached_memory.abs() < 1e-4).float().mean().item(),
             }
 
             self.accelerator.log(
@@ -759,4 +777,4 @@ class Experiment:
         self.model, self.optimizer, self.train_dataloader, self.eval_dataloader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_dataloader, self.eval_dataloader, self.scheduler
         )
-        self.train_loop()
+        # self.train_loop()
